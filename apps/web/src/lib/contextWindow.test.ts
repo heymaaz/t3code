@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { EventId, type OrchestrationThreadActivity, TurnId } from "@t3tools/contracts";
 
-import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "./contextWindow";
+import {
+  deriveLatestContextWindowSnapshot,
+  formatContextWindowTokens,
+  formatProviderDisplayName,
+} from "./contextWindow";
 
 function makeActivity(id: string, kind: string, payload: unknown): OrchestrationThreadActivity {
   return {
@@ -80,5 +84,10 @@ describe("contextWindow", () => {
 
     expect(snapshot?.usedTokens).toBe(81_659);
     expect(snapshot?.totalProcessedTokens).toBe(748_126);
+  });
+
+  it("distinguishes OpenCode 2 from OpenCode", () => {
+    expect(formatProviderDisplayName("opencode")).toBe("OpenCode");
+    expect(formatProviderDisplayName("opencode2")).toBe("OpenCode 2");
   });
 });

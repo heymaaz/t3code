@@ -183,6 +183,8 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits until the current event consumer has processed every queued event. */
     readonly drainEvents: Effect.Effect<void>;
+    /** Completes when the scoped ACP child process exits. */
+    readonly waitForExit: Effect.Effect<number, EffectAcpErrors.AcpError>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
@@ -765,9 +767,7 @@ export const make = (
             if (Option.isSome(activePromptFiber)) {
               yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
             }
-            yield* acp.agent
-              .cancel({ sessionId: started.sessionId })
-              .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+            yield* acp.agent.cancel({ sessionId: started.sessionId }).pipe(Effect.ignore);
           }),
         ),
       ),
@@ -806,6 +806,16 @@ export const make = (
       request: (method, payload) =>
         runLoggedRequest(method, payload, acp.raw.request(method, payload)),
       notify: acp.raw.notify,
+      waitForExit: child.exitCode.pipe(
+        Effect.map(Number),
+        Effect.mapError(
+          (cause) =>
+            new EffectAcpErrors.AcpTransportError({
+              detail: "Failed to observe ACP process exit.",
+              cause,
+            }),
+        ),
+      ),
     } satisfies AcpSessionRuntime["Service"];
   });
 
