@@ -328,7 +328,7 @@ export const checkOpenCode2ProviderStatus = Effect.fn("checkOpenCode2ProviderSta
       installed: true,
       version: discoveredVersion,
       status: "ready",
-      auth: { status: "unknown" },
+      auth: { status: "authenticated" },
     },
   });
 });

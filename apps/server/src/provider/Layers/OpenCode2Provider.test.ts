@@ -64,6 +64,7 @@ describe("OpenCode2Provider", () => {
         process.env,
       );
       expect(snapshot.status).toBe("ready");
+      expect(snapshot.auth.status).toBe("authenticated");
       expect(snapshot.models.length).toBeGreaterThan(0);
       expect(snapshot.models[0]?.slug).toBeTruthy();
       expect(
