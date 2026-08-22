@@ -74,10 +74,12 @@ import {
 } from "../markdown-clipboard";
 import { remarkNormalizeListItemIndentation } from "../markdown-list-indentation";
 import {
+  extractMarkdownLinkHrefs,
   normalizeMarkdownLinkDestination,
   resolveInlineCodeFileLinkMeta,
   resolveMarkdownFileLinkMeta,
   rewriteMarkdownFileUriHref,
+  shouldOpenMarkdownFileLinkInEditor,
   type MarkdownFileLinkMeta,
 } from "../markdown-links";
 import { readLocalApi } from "../localApi";
@@ -90,6 +92,13 @@ import { usePreparedConnection } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
+import { projectEnvironment } from "../state/projects";
+import {
+  claimWorkspaceBasenameLookup,
+  needsWorkspaceBasenameLookup,
+  pickWorkspaceBasenameMatch,
+  WORKSPACE_BASENAME_LOOKUP_LIMIT,
+} from "../workspaceBasenameLookup";
 import { useOpenChangeRequestLink } from "~/lib/openPullRequestLink";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { isPreviewSupportedInRuntime } from "../previewStateStore";
@@ -110,6 +119,8 @@ interface ChatMarkdownProps {
   className?: string;
   /** Treat single newlines as hard breaks — chat-style user input. */
   lineBreaks?: boolean;
+  /** Parse sanitized raw HTML instead of displaying its source text. */
+  parseRawHtml?: boolean;
 }
 
 const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
@@ -146,6 +157,28 @@ function findTaskListMarkerOffset(markdown: string, listItemStart: number): numb
   if (!match?.[1]) return null;
   return listItemStart + firstLine.indexOf(match[1]);
 }
+
+/**
+ * The default `1.25rem` marker gutter (`.chat-markdown ol`) fits markers up to
+ * two characters wide. Once a marker reaches three characters (item 100+),
+ * `list-style-position: outside` paints it wider than that gutter and clips
+ * the leading character against the item's own overflow. Rather than widening
+ * the gutter for every list, only lists whose widest marker is 3+ characters
+ * get a wider `--list-gutter`. The width includes a negative marker's minus
+ * sign.
+ */
+export function orderedListGutterStyle(
+  itemCount: number,
+  start: unknown,
+): { "--list-gutter": string } | undefined {
+  const parsedStart = Number.parseInt(String(start ?? 1), 10);
+  const firstNumber = Number.isNaN(parsedStart) ? 1 : parsedStart;
+  const lastNumber = firstNumber + Math.max(itemCount - 1, 0);
+  const markerWidth = Math.max(String(firstNumber).length, String(lastNumber).length);
+  if (markerWidth <= 2) return undefined;
+  return { "--list-gutter": `${markerWidth + 1}ch` };
+}
+
 const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
   attributes: {
@@ -791,11 +824,11 @@ interface MarkdownFileLinkProps {
   theme: "light" | "dark";
   threadRef?: ScopedThreadRef | undefined;
   onOpen: (targetPath: string) => Promise<AtomCommandResult<unknown, unknown>>;
+  onOpenInPanel: (workspaceRelativePath: string, line: number | undefined) => void;
   onOpenInBrowser?: (() => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
   className?: string | undefined;
 }
 
-const MARKDOWN_LINK_HREF_PATTERN = /\[[^\]]*]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g;
 const MARKDOWN_FILE_LINK_CLASS_NAME =
   "chat-markdown-file-link cursor-pointer transition-colors hover:bg-accent/70";
 
@@ -872,16 +905,6 @@ function extractInlineCodeSpans(text: string): string[] {
     }
   }
   return spans;
-}
-
-function extractMarkdownLinkHrefs(text: string): string[] {
-  const hrefs: string[] = [];
-  for (const match of text.matchAll(MARKDOWN_LINK_HREF_PATTERN)) {
-    const href = match[1]?.trim();
-    if (!href) continue;
-    hrefs.push(href);
-  }
-  return hrefs;
 }
 
 function normalizeMarkdownLinkHrefKey(href: string): string {
@@ -1096,6 +1119,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
   theme,
   threadRef,
   onOpen,
+  onOpenInPanel,
   onOpenInBrowser,
   className,
 }: MarkdownFileLinkProps) {
@@ -1139,8 +1163,8 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
       handleOpenInEditor();
       return;
     }
-    useRightPanelStore.getState().openFile(threadRef, workspaceRelativePath, line);
-  }, [handleOpenInEditor, line, threadRef, workspaceRelativePath]);
+    onOpenInPanel(workspaceRelativePath, line);
+  }, [handleOpenInEditor, line, onOpenInPanel, threadRef, workspaceRelativePath]);
 
   const handleOpenInBrowser = useCallback(() => {
     if (!onOpenInBrowser) {
@@ -1276,6 +1300,10 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
+              if (shouldOpenMarkdownFileLinkInEditor(event)) {
+                handleOpenInEditor();
+                return;
+              }
               if (onOpenInBrowser) {
                 handleOpenInBrowser();
                 return;
@@ -1292,8 +1320,10 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
         side="top"
         className="max-w-[min(40rem,calc(100vw-2rem))] font-mono text-[11px] leading-tight"
       >
+        {/* The full path: the chip already shows the shortened form, and a link
+            to the workspace root collapses to a bare label that repeats it. */}
         <div className="overflow-x-auto whitespace-nowrap [scrollbar-color:color-mix(in_srgb,var(--border)_78%,transparent)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[color-mix(in_srgb,var(--border)_78%,transparent)] [&::-webkit-scrollbar-track]:bg-transparent">
-          {displayPath}
+          {targetPath}
         </div>
       </TooltipPopup>
     </Tooltip>
@@ -1316,6 +1346,7 @@ function areMarkdownFileLinkPropsEqual(
     previous.theme === next.theme &&
     previous.threadRef === next.threadRef &&
     previous.onOpen === next.onOpen &&
+    previous.onOpenInPanel === next.onOpenInPanel &&
     previous.onOpenInBrowser === next.onOpenInBrowser &&
     previous.className === next.className
   );
@@ -1330,9 +1361,13 @@ function ChatMarkdown({
   skills = EMPTY_MARKDOWN_SKILLS,
   className,
   lineBreaks = false,
+  parseRawHtml = true,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
+    reportFailure: false,
+  });
+  const searchProjectEntries = useAtomQueryRunner(projectEnvironment.searchEntries, {
     reportFailure: false,
   });
   const openPreview = useAtomCommand(previewEnvironment.open, {
@@ -1437,6 +1472,40 @@ function ChatMarkdown({
     },
     [createAssetUrl, openPreview, preparedConnection, threadRef],
   );
+  // A bare filename resolves to the workspace root, which is rarely where the
+  // file is, so ask the index before opening.
+  const openFileInPanel = useCallback(
+    (workspaceRelativePath: string, line: number | undefined) => {
+      if (!threadRef) return;
+      // Claimed on every open so a synchronous one supersedes a lookup already
+      // in flight.
+      const isLatestLookup = claimWorkspaceBasenameLookup();
+      const openAt = (path: string) =>
+        useRightPanelStore.getState().openFile(threadRef, path, line);
+      if (!cwd || !needsWorkspaceBasenameLookup(workspaceRelativePath)) {
+        openAt(workspaceRelativePath);
+        return;
+      }
+      void (async () => {
+        const result = await searchProjectEntries({
+          environmentId: threadRef.environmentId,
+          input: {
+            cwd,
+            query: workspaceRelativePath,
+            limit: WORKSPACE_BASENAME_LOOKUP_LIMIT,
+            kind: "file",
+          },
+        });
+        const match =
+          result._tag === "Success"
+            ? pickWorkspaceBasenameMatch(workspaceRelativePath, result.value.entries)
+            : null;
+        if (!isLatestLookup()) return;
+        openAt(match ?? workspaceRelativePath);
+      })();
+    },
+    [cwd, searchProjectEntries, threadRef],
+  );
   /* eslint-disable react/no-unstable-nested-components -- ReactMarkdown requires component
    * renderers that close over this message's metadata. useMemo keeps them stable until that
    * metadata changes. */
@@ -1470,6 +1539,7 @@ function ChatMarkdown({
           theme={resolvedTheme}
           threadRef={threadRef}
           onOpen={openInPreferredEditor}
+          onOpenInPanel={openFileInPanel}
           onOpenInBrowser={
             threadRef &&
             isPreviewSupportedInRuntime() &&
@@ -1504,6 +1574,15 @@ function ChatMarkdown({
             </p>
             {children}
           </div>
+        );
+      },
+      ol({ node, start, style, ...props }) {
+        const itemCount =
+          node?.children?.filter((child) => child.type === "element" && child.tagName === "li")
+            .length ?? 0;
+        const gutterStyle = orderedListGutterStyle(itemCount, start);
+        return (
+          <ol {...props} start={start} style={gutterStyle ? { ...style, ...gutterStyle } : style} />
         );
       },
       li({ node, children, ...props }) {
@@ -1545,9 +1624,12 @@ function ChatMarkdown({
           />
         );
       },
-      a({ node, href, children, ...props }) {
+      a({ node, href, children, title: _title, ...props }) {
         const normalizedHref = href ? normalizeMarkdownLinkHrefKey(href) : "";
-        const fileLinkMeta = normalizedHref ? markdownFileLinkMetaByHref.get(normalizedHref) : null;
+        const fileLinkMeta = normalizedHref
+          ? (markdownFileLinkMetaByHref.get(normalizedHref) ??
+            resolveMarkdownFileLinkMeta(normalizedHref, cwd))
+          : null;
         if (!fileLinkMeta) {
           const faviconHost = resolveExternalWebLinkHost(href);
           const isSameDocumentLink = href?.startsWith("#") ?? false;
@@ -1630,6 +1712,9 @@ function ChatMarkdown({
           props.className,
         );
       },
+      img({ node: _node, title: _title, ...props }) {
+        return <img {...props} />;
+      },
       code({ node, children, className, ...props }) {
         if (node?.properties?.dataInlineCode != null) {
           const codeText = nodeToPlainText(children);
@@ -1689,6 +1774,7 @@ function ChatMarkdown({
     isStreaming,
     markdownFileLinkMetaByHref,
     onTaskListChange,
+    openFileInPanel,
     openInPreferredEditor,
     openExternalLinkInPreview,
     openMarkdownFileInPreview,
@@ -1699,6 +1785,9 @@ function ChatMarkdown({
   ]);
   /* eslint-enable react/no-unstable-nested-components */
 
+  // react-markdown converts unparsed HTML nodes to text when skipHtml is false.
+  // Keep that behavior explicit because literal mode depends on escaping the
+  // complete source token instead of dropping it from the rendered message.
   return (
     <div
       className={cn(
@@ -1711,7 +1800,8 @@ function ChatMarkdown({
         remarkPlugins={
           lineBreaks ? CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS : CHAT_MARKDOWN_REMARK_PLUGINS
         }
-        rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}
+        rehypePlugins={parseRawHtml ? CHAT_MARKDOWN_REHYPE_PLUGINS : undefined}
+        skipHtml={false}
         components={markdownComponents}
         urlTransform={markdownUrlTransform}
       >
